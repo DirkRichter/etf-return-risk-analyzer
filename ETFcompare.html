@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ETF Analysis: Return vs. Risk</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 20px;
+            background-color: #f8f9fa;
+            color: #333;
+        }
+        .container {
+            max-width: 100vw;
+            margin: 0 auto;
+            background: white;
+            padding: 25px;
+            border-radius: 8px;
+        }
+        h1 {
+            font-size: 24px;
+            color: #2c3e50;
+            margin-bottom: 5px;
+        }
+        p.subtitle {
+            color: #7f8c8d;
+            margin-bottom: 25px;
+        }
+        .chart-container {
+            position: relative;
+            height: 80vh;
+            width: 100%;
+        }
+        .loading {
+            text-align: center;
+            color: #3498db;
+            font-weight: bold;
+            margin-top: 20px;
+        }
+        #spider-charts {
+          display: flex;
+          flex-wrap: wrap;
+          justify-content: center;
+          gap: 30px;
+          margin-top: 40px;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div id="loading" class="loading">Loading data...</div>
+    <div class="chart-container">
+        <canvas id="etfChart1"></canvas>
+        <canvas id="etfChart2"></canvas>
+        <canvas id="etfChart3"></canvas>
+        <div id="spider-charts" />
+    </div>
+</div>
+
+<script>
+/**
+ * Target ETF universe defined by their unique ISIN identifiers.
+ * Outliers that heavily distort global min/max standardization boundaries are commented out.
+ */
+const etfList = [
+    'IE00BP3QZB59', 'IE00B469F816', 'NL0011683594', 'LU0908500753', 'DE000A0F5UH1', 
+    'IE000MRIQ479', 'IE0003R87OG3', 'IE00BSPLC413', 'IE000CK5G8J7', 'IE000EJ2EHO7', 
+    'IE00B5BMR087', 'IE0006WW1TQ4', 'LU0322253906', 'IE00BHZRR147', 'IE000OEF25S1', 
+    'IE00B3YLTY66', 'LU2611732046', 'IE00B4L5Y983', 'IE00BG0SKF03', 'LU0486851024', 
+    'IE00BK5BR626', 'IE00BF4RFH31', 'IE00BP3QZ825', 'IE00B48X4842', 'IE00BQN1K786',
+    'IE000KHX9DX6' /*Rare Earths Miners*/, 'IE00BQQP9F84' /*Gold Miners*/, 'IE000QDFFK00' /*Nasdaq100*/, 'DE0006289382' /*Titan50*/
+];
+ 
+// API Metric Fields assigned to the Return Score vector
+const perf_fields = ['portfolio_fc_exp_gewinnwachstum', 'portfolio_fc_buchwertwachstum', 'portfolio_fc_cashflowwachstum', 'portfolio_fc_umsatzwachstum', 'return_1_month_real', 'return_6_month_real', 'return_1_year_real', 'sharpe_ratio_1_year'];
+// API Metric Fields assigned to the Risk/Valuation Score vector
+const risk_fields = ['portfolio_items_weight', 'portfolio_kbv', 'portfolio_kgv', 'portfolio_kurs_cashflow', 'volatility_1_year'];
+
+/**
+ * Fetches data from ExtraETF API using an integrated localStorage cache mechanism 
+ * to bypass aggressive rate-limiting and maximize application responsiveness.
+ * @param {string} etf - The ISIN of the target asset.
+ * @returns {Promise<Object>} Cleaned JSON data wrapper for the asset.
+ */
+async function fetchETFWithCache(etf) {
+    const url = `https://extraetf.com/api-v2/detail/?isin=${etf}`;
+    const cacheKey = `cache_${etf}`;
+    const timeKey = `time_${etf}`;
+    
+    const cachedData = localStorage.getItem(cacheKey);
+    const cachedTime = localStorage.getItem(timeKey);
+    
+    const twoDays = 48 * 60 * 60 * 1000; // 48-hour cache lifetime window
+    const now = Date.now();
+
+    // Use fast local cache if conditions are met
+    if (cachedData && cachedTime && (now - cachedTime < twoDays)) {
+        return JSON.parse(cachedData);
+    }
+
+    // Fallback to live API network request
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Network response failure for ISIN: ${etf}`);
+    const data = await response.json();
+
+    // Commit response payload and modern timestamp to cache
+    localStorage.setItem(cacheKey, JSON.stringify(data));
+    localStorage.setItem(timeKey, now.toString());
+
+    return data;
+}
+
+/**
+ * Master controller function orchestrating data ingestion, statistical normalization,
+ * algorithmic multi-factor scoring, and execution of Chart.js renderer modules.
+ */
+async function loadETFData() {
+    const loadedETFs = [];
+    // Aggregation mapping sequence: Performance metrics mapped to the top, Risk to the bottom
+    const orderedFields = [...perf_fields, ...risk_fields];
+
+    // Phase 1: Ingest batch payloads asynchronously
+    for (const etf of etfList) {
+        try {
+            const json = await fetchETFWithCache(etf);
+            const data = json.results[0];
+
+            if (data) {
+                loadedETFs.push({
+                    label: data.fondname || etf,
+                    ...data
+                });
+            }
+        } catch (error) {
+            console.warn(`Could not load data for ${etf} via API framework.`, error);
+        }
+    }
+
+    if (loadedETFs.length === 0) {
+        document.getElementById('loading').style.display = 'none';
+        return;
+    }
+
+    // Phase 2: Establish global normalization boundaries (Min/Max values across entire universe)
+    const fieldBoundaries = {};
+    orderedFields.forEach(field => {
+        const values = loadedETFs
+            .map(e => e[field])
+            .filter(v => v !== undefined && v !== null && !isNaN(v));
+
+        fieldBoundaries[field] = {
+            min: Math.min(...values),
+            max: Math.max(...values)
+        };
+    });
+
+    /**
+     * Standardizes any financial value to a uniform 0.0 - 1.0 boundary layer.
+     */
+    const normalize = (val, field) => {
+        const { min, max } = fieldBoundaries[field];
+        if (max === min) return 0.5;
+        return (val - min) / (max - min);
+    };
+
+    /**
+     * Calculates the unweighted mean score of multiple normalized metrics.
+     */
+    const calculateScore = (etf, fields) => {
+        let sum = 0;
+        let count = 0;
+        fields.forEach(f => {
+            const val = etf[f];
+            if (val !== undefined && val !== null && !isNaN(val)) {
+                sum += normalize(val, f);
+                count++;
+            }
+        });
+        return count > 0 ? sum / count : 0;
+    };
+
+    // Phase 3: Matrix transformation pipelines
+    const plotData1 = [];
+    const plotData2 = [];
+    const plotData3 = [];
+    const spiderDataSets = [];
+
+    loadedETFs.forEach(etf => {
+        // Core Matrix Metrics (Risk vs. Return Profiles)
+        const x = calculateScore(etf, risk_fields);
+        // Overweighting dynamic growth metrics to refine specific alpha anomalies
+        const perf_fields3 = [...Array(3).fill('portfolio_fc_exp_gewinnwachstum'), ...perf_fields.slice(1)];
+        const y = calculateScore(etf, perf_fields3);
+        plotData1.push({ label: etf.label, x, y });
+        
+        // Growth-Adjusted Valuation (PEG & PBG metrics)
+        plotData2.push({ 
+            label: etf.label, 
+            x: etf['portfolio_kgv'] / etf['portfolio_fc_exp_gewinnwachstum'], 
+            y: etf['portfolio_kbv'] / etf['portfolio_fc_buchwertwachstum']
+        });
+        
+        // Cross-Sectional Fundamental Values
+        plotData3.push({ label: etf.label, x: etf['portfolio_kbv'], y: etf['portfolio_fc_exp_gewinnwachstum']});
+
+        // Structure individual radar/spider value vectors (Risk is inverted: higher score = better/less risk)
+        const spiderValues = perf_fields.map(f => {
+            const val = etf[f];
+            return (val !== undefined && val !== null && !isNaN(val)) ? normalize(val, f) : 0.5;
+        }).concat(risk_fields.map(f => {
+            const val = etf[f];
+            return (val !== undefined && val !== null && !isNaN(val)) ? 1 - normalize(val, f) : 0.5;
+        }));
+
+        spiderDataSets.push({
+            label: etf.label,
+            labels: orderedFields.map(function(x){return x.replace('portfolio_','').replaceAll('_',' ');}),
+            data: spiderValues
+        });
+    });
+
+    // Tear down load overlay UI component
+    document.getElementById('loading').style.display = 'none';
+    
+    // Phase 4: Execute Chart Canvas Initialization Loops
+    createChart(plotData1, 'etfChart1', 'Risk Score → High', 'Return Score → High');
+    createChart(plotData2, 'etfChart2', 'Earnings Basis: PEG = P/E / Earnings Growth → Bad', 'Fundamental Basis: PBG = P/B / Book Value Growth → Bad');
+    createChart(plotData3, 'etfChart3', 'P/B Ratio (KBV)', 'Estimated Earnings Growth');
+    createSpiderCharts(spiderDataSets);
+}
+
+/**
+ * Dynamically instantiates individual small-multiples Radar charts sorted by score average.
+ * @param {Array<Object>} spiderDataSets - Array of compiled asset specific radar parameters.
+ */
+function createSpiderCharts(spiderDataSets) {
+    const wrapper = document.getElementById('spider-charts');
+    if (!wrapper) return;
+    wrapper.innerHTML = '';
+
+    spiderDataSets
+        .map(d => ({ ...d, avg: d.data.length ? (d.data.reduce((s, v) => s + v, 0) + d.data[0] * 2) / (d.data.length + 2) : 0 }))
+        .sort((a, b) => b.avg - a.avg) // High performance footprint configurations sort to top
+        .forEach((d, i) => {
+            const box = document.createElement('div');
+            box.className = 'spider-chart-box';
+            Object.assign(box.style, { width: '350px', height: '200px', position: 'relative' });
+
+            const canvas = document.createElement('canvas');
+            canvas.id = `spiderChart-${i}`;
+            box.appendChild(canvas);
+            wrapper.appendChild(box);
+
+            const hue = d.avg * 200 - 50; // Dynamic shifting hue color map assignment based on performance strength
+            const color = `hsl(${hue}, 70%, 50%)`;
+
+            new Chart(canvas.getContext('2d'), {
+                type: 'radar',
+                data: {
+                    labels: d.labels,
+                    datasets: [{ label: d.label, data: d.data, backgroundColor: `hsla(${hue}, 70%, 50%, 0.2)`, borderColor: color, pointBackgroundColor: color, pointHoverBackgroundColor: '#fff', pointHoverBorderColor: color, borderWidth: 2 }]
+                },
+                options: { responsive: true, maintainAspectRatio: false, scales: { r: { min: 0, max: 1, ticks: { display: false }, pointLabels: { font: { size: 11 } } } }, plugins: { legend: { position: 'top', labels: { padding: 0 } } } }
+            });
+        });
+}
+
+/**
+ * Algorithmic generation of equidistant, distinct high contrast HSL color strings.
+ * @param {number} n - Required number of unique color palettes.
+ * @returns {Array<string>} Array of unique HSL strings.
+ */
+function getDistinctColors(n) {
+    const colors = [];
+    for (let i = 0; i < n; i++) {
+        const hue = (i * (360 / n)) % 360; // Perfectly distributed around color perimeter wheel
+        colors.push(`hsl(${Math.round(hue)}, 70%, 50%)`);
+    }
+    return colors;
+}
+
+/**
+ * Standard implementation interface for Chart.js 2D Scatter canvas configurations.
+ */
+function createChart(data, html_id, xaxis, yaxis) {
+    const ctx = document.getElementById(html_id).getContext('2d');
+    const colors = getDistinctColors(data.length);
+    
+    // Separate independent data objects mapped explicitly into single series to preserve distinct tooltips
+    const datasets = data.map((etf, index) => {
+        const color = colors[index];
+        return {
+            label: etf.label,
+            data: [{ x: etf.x, y: etf.y }],
+            backgroundColor: color,
+            borderColor: color,
+            pointRadius: 6,
+            pointHoverRadius: 10
+        };
+    });
+
+    new Chart(ctx, {
+        type: 'scatter',
+        data: { datasets: datasets },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                x: {
+                    title: { display: true, text: xaxis, font: { size: 14, weight: 'bold' } },
+                    grid: { color: '#eef0f2' }
+                },
+                y: {
+                    title: { display: true, text: yaxis, font: { size: 14, weight: 'bold' } },
+                    grid: { color: '#eef0f2' }
+                }
+            },
+            plugins: {
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            return `${context.dataset.label}: ${context.raw.x.toFixed(2)}, ${context.raw.y.toFixed(2)}`;
+                        }
+                    }
+                },
+                legend: { display: false }
+            }
+        }
+    });
+}
+
+// Start data retrieval pipeline execution context
+loadETFData();
+</script>
+
+</body>
+</html>
