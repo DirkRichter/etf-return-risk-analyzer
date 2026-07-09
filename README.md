@@ -1,6 +1,8 @@
 # etf-return-risk-analyzer
 An interactive financial tool that visualizes and compares ETFs using data-driven Return and Risk Scores. Built with HTML5 and Chart.js, it translates complex fundamental metrics, valuation multiples (PEG/PBG), and historical volatility into intuitive scatter matrices and dynamic radar profiles.
 
+Live-Demo: https://DirkRichter.github.io/etf-return-risk-analyzer
+
 # ETF Analysis: Return vs. Risk
 
 A dynamic, browser-based vibe-coding project designed to analyze and compare Exchange Traded Funds (ETFs) by visualizing their fundamental growth metrics, valuation ratios, and risk profiles using interactive **Chart.js** scatter and radar plots.
