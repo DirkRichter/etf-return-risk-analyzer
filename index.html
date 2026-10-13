@@ -56,6 +56,7 @@
         <canvas id="etfChart1"></canvas>
         <canvas id="etfChart2"></canvas>
         <canvas id="etfChart3"></canvas>
+        <canvas id="etfChart4"></canvas>
         <div id="spider-charts" />
     </div>
 </div>
@@ -70,8 +71,11 @@ const etfList = [
     'IE000MRIQ479', 'IE0003R87OG3', 'IE00BSPLC413', 'IE000CK5G8J7', 'IE000EJ2EHO7', 
     'IE00B5BMR087', 'IE0006WW1TQ4', 'LU0322253906', 'IE00BHZRR147', 'IE000OEF25S1', 
     'IE00B3YLTY66', 'LU2611732046', 'IE00B4L5Y983', 'IE00BG0SKF03', 'LU0486851024', 
-    'IE00BK5BR626', 'IE00BF4RFH31', 'IE00BP3QZ825', 'IE00B48X4842', 'IE00BQN1K786',
-    'IE000KHX9DX6' /*Rare Earths Miners*/, 'IE00BQQP9F84' /*Gold Miners*/, 'IE000QDFFK00' /*Nasdaq100*/, 'DE0006289382' /*Titan50*/
+    'IE00BK5BR626', 'IE00BF4RFH31', 'IE00BP3QZ825', 'IE00B48X4842', 'IE00BQN1K786', //'IE00BWBXM617' /* us health care */,
+    'IE000KYX7IP4' /* financials */, 'IE00BYQCZN58' /* japan dividenden */, 'IE000S67ID55' /* small+mid cap value */, 'IE00BK5BCH80' /* clean energy */,
+    'IE000D8FCSD8' /* private equity */, 'IE00B23LNQ02' /* All-World Value */, 'IE000W8WMSL2' /* quantum computing */
+    //'IE00BM67HN09' /* wld consumers */
+    //'IE000S67ID55' /*global targeted value => small+mid value caps */, 'IE000KHX9DX6' /*Rare Earths Miners*/, 'IE00BQQP9F84' /*Gold Miners*/, 'IE000QDFFK00' /*Nasdaq100*/, 'DE0006289382' /*Titan50*/
 ];
  
 // API Metric Fields assigned to the Return Score vector
@@ -79,8 +83,26 @@ const perf_fields = ['portfolio_fc_exp_gewinnwachstum', 'portfolio_fc_buchwertwa
 // API Metric Fields assigned to the Risk/Valuation Score vector
 const risk_fields = ['portfolio_items_weight', 'portfolio_kbv', 'portfolio_kgv', 'portfolio_kurs_cashflow', 'volatility_1_year'];
 
+// --- Native Compression Helpers ---
+async function compressToStorage(jsonString) {
+    const stream = new Blob([jsonString]).stream().pipeThrough(new CompressionStream('gzip'));
+    const blob = await new Response(stream).blob();
+    return new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result);
+        reader.readAsDataURL(blob);
+    });
+}
+
+async function decompressFromStorage(base64DataUrl) {
+    const res = await fetch(base64DataUrl);
+    const stream = res.body.pipeThrough(new DecompressionStream('gzip'));
+    return await new Response(stream).text();
+}
+
+// --- Refactored Main Function ---
 /**
- * Fetches data from ExtraETF API using an integrated localStorage cache mechanism 
+ * Fetches data from ExtraETF API using a compressed localStorage cache mechanism 
  * to bypass aggressive rate-limiting and maximize application responsiveness.
  * @param {string} etf - The ISIN of the target asset.
  * @returns {Promise<Object>} Cleaned JSON data wrapper for the asset.
@@ -97,18 +119,36 @@ async function fetchETFWithCache(etf) {
     const now = Date.now();
 
     // Use fast local cache if conditions are met
-    if (cachedData && cachedTime && (now - cachedTime < twoDays)) {
-        return JSON.parse(cachedData);
+    if (cachedData && cachedTime && (now - Number(cachedTime) < twoDays)) {
+        try {
+            // Dekomprimierung versuchen
+            const decompressed = await decompressFromStorage(cachedData);
+            return JSON.parse(decompressed);
+        } catch (e) {
+            // Fallback für alte, noch unkomprimierte Cache-Einträge
+            try {
+                return JSON.parse(cachedData);
+            } catch {
+                /* Korrupter Cache wird ignoriert -> Neuer API-Fetch */
+            }
+        }
     }
 
     // Fallback to live API network request
     const response = await fetch(url);
     if (!response.ok) throw new Error(`Network response failure for ISIN: ${etf}`);
     const data = await response.json();
+    
+    // TODO: remove non-relevant data: performance_index_monthly, performance_index_yearly, performance_monthly, performance_yearly
 
-    // Commit response payload and modern timestamp to cache
-    localStorage.setItem(cacheKey, JSON.stringify(data));
-    localStorage.setItem(timeKey, now.toString());
+    // Compression and Commit response payload + timestamp to cache
+    try {
+        const compressed = await compressToStorage(JSON.stringify(data));
+        localStorage.setItem(cacheKey, compressed);
+        localStorage.setItem(timeKey, now.toString());
+    } catch (e) {
+        console.warn('Failed to write compressed ETF cache:', e);
+    }
 
     return data;
 }
@@ -186,6 +226,7 @@ async function loadETFData() {
     const plotData1 = [];
     const plotData2 = [];
     const plotData3 = [];
+    //const plotData4 = [];
     const spiderDataSets = [];
 
     loadedETFs.forEach(etf => {
@@ -203,8 +244,11 @@ async function loadETFData() {
             y: etf['portfolio_kbv'] / etf['portfolio_fc_buchwertwachstum']
         });
         
-        // Cross-Sectional Fundamental Values
-        plotData3.push({ label: etf.label, x: etf['portfolio_kbv'], y: etf['portfolio_fc_exp_gewinnwachstum']});
+        // exp gewinn vs. kbv
+        plotData3.push({ label: etf.label, x: etf['portfolio_kbv']-etf['sharpe_ratio_1_year'], y: etf['portfolio_fc_exp_gewinnwachstum']});
+        
+        // exp gewinn vs. sharpratio
+        //plotData4.push({ label: etf.label, x: etf['sharpe_ratio_1_year'], y: etf['portfolio_fc_exp_gewinnwachstum']});
 
         // Structure individual radar/spider value vectors (Risk is inverted: higher score = better/less risk)
         const spiderValues = perf_fields.map(f => {
@@ -226,9 +270,10 @@ async function loadETFData() {
     document.getElementById('loading').style.display = 'none';
     
     // Phase 4: Execute Chart Canvas Initialization Loops
-    createChart(plotData1, 'etfChart1', 'Risk Score → High', 'Return Score → High');
+    createChart(plotData1, 'etfChart1', 'Risk Score → Bad', 'Return Score → Good');
     createChart(plotData2, 'etfChart2', 'Earnings Basis: PEG = P/E / Earnings Growth → Bad', 'Fundamental Basis: PBG = P/B / Book Value Growth → Bad');
-    createChart(plotData3, 'etfChart3', 'P/B Ratio (KBV)', 'Estimated Earnings Growth');
+    createChart(plotData3, 'etfChart3', 'P/B Ratio (KBV) - sharpe_ratio_1_year → Bad', 'Estimated Earnings Growth → Good');
+    //createChart(plotData4, 'etfChart4', 'sharpe_ratio_1_year → Good', 'Estimated Earnings Growth → Good');
     createSpiderCharts(spiderDataSets);
 }
 
